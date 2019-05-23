@@ -37,6 +37,7 @@ from oic.exception import NotForMe
 from oic.exception import ParameterError
 from oic.exception import SubMismatch
 from oic.exception import UnSupported
+from oic.oauth2 import PBase
 from oic.oauth2 import compact
 from oic.oauth2 import error_response
 from oic.oauth2 import redirect_authz_error
@@ -52,11 +53,11 @@ from oic.oic import PROVIDER_DEFAULT
 from oic.oic import Server
 from oic.oic import claims_match
 from oic.oic import scope2claims
-from oic.oic.message import SCOPE2CLAIMS
 from oic.oic.message import AccessTokenRequest
 from oic.oic.message import AccessTokenResponse
 from oic.oic.message import AuthorizationRequest
 from oic.oic.message import AuthorizationResponse
+from oic.oic.message import BACK_CHANNEL_LOGOUT_EVENT
 from oic.oic.message import Claims
 from oic.oic.message import ClientRegistrationErrorResponse
 from oic.oic.message import DiscoveryRequest
@@ -69,15 +70,17 @@ from oic.oic.message import ProviderConfigurationResponse
 from oic.oic.message import RefreshAccessTokenRequest
 from oic.oic.message import RegistrationRequest
 from oic.oic.message import RegistrationResponse
+from oic.oic.message import SCOPE2CLAIMS
 from oic.oic.message import TokenErrorResponse
 from oic.utils import sort_sign_alg
-from oic.utils.http_util import OAUTH2_NOCACHE_HEADERS
 from oic.utils.http_util import BadRequest
 from oic.utils.http_util import CookieDealer
 from oic.utils.http_util import Created
+from oic.utils.http_util import OAUTH2_NOCACHE_HEADERS
 from oic.utils.http_util import Response
 from oic.utils.http_util import SeeOther
 from oic.utils.http_util import Unauthorized
+from oic.utils.jwt import JWT
 from oic.utils.keyio import KeyBundle
 from oic.utils.keyio import dump_jwks
 from oic.utils.keyio import key_export
@@ -210,7 +213,9 @@ class Provider(AProvider):
                  hostname="", template_lookup=None, template=None,
                  verify_ssl=True, capabilities=None, schema=OpenIDSchema,
                  jwks_uri='', jwks_name='', baseurl=None, client_cert=None,
-                 extra_claims=None, template_renderer=render_template, extra_scope_dict=None):
+                 extra_claims=None, template_renderer=render_template,
+                 extra_scope_dict=None, post_logout_page='',
+                 self_signing_alg='RS256', logout_path=''):
 
         AProvider.__init__(self, name, sdb, cdb, authn_broker, authz,
                            client_authn, symkey, urlmap,
@@ -273,6 +278,11 @@ class Provider(AProvider):
         # Allow custom schema (inheriting from OpenIDSchema) to be used -
         # additional attributes
         self.schema = schema
+        self.httpc = PBase(verify_ssl=verify_ssl, keyjar=self.keyjar)
+        self.post_logout_page = post_logout_page
+        self.signing_alg = self_signing_alg
+        self.logout_path = logout_path
+        self.logout_verify_url = ''
 
     def build_jwx_def(self):
         self.jwx_def = {}
@@ -485,188 +495,11 @@ class Provider(AProvider):
         # return the best I have
         return None, None
 
-    def verify_post_logout_redirect_uri(self, esreq, client_id):
-        """
-
-        :param esreq: End session request
-        :param client_id: The Client ID
-        :return:
-        """
-        try:
-            redirect_uri = esreq["post_logout_redirect_uri"]
-        except KeyError:
-            logger.debug("Missing post_logout_redirect_uri parameter")
-            return
-
-        try:
-            accepted_urls = self.cdb[client_id]["post_logout_redirect_uris"]
-            if self._verify_url(redirect_uri, accepted_urls):
-                return redirect_uri
-        except Exception as exc:
-            msg = "An error occurred while verifying redirect URI: %s"
-            logger.debug(msg, str(exc))
-
-        return None
-
     def is_session_revoked(self, request="", cookie=None):
         areq = parse_qs(request)
         authn, _ = self.pick_auth(areq)
         identity, _ts = authn.authenticated_as(cookie)
         return self.sdb.is_revoke_uid(identity["uid"])
-
-    def let_user_verify_logout(self, uid, esr, cookie, redirect_uri):
-        if cookie:
-            headers = [cookie]
-        else:
-            headers = []
-
-        self.sdb.set_verified_logout(uid)
-
-        if redirect_uri is not None:
-            redirect = redirect_uri
-        else:
-            redirect = "/"
-        try:
-            tmp_id_token_hint = esr["id_token_hint"]
-        except KeyError:
-            tmp_id_token_hint = ""
-
-        context = {
-            "id_token_hint": tmp_id_token_hint,
-            "post_logout_redirect_uri": esr["post_logout_redirect_uri"],
-            "key": self.sdb.get_verify_logout(uid),
-            "redirect": redirect,
-            "action": "/" + EndSessionEndpoint("").etype
-        }
-        return Response(self.template_renderer('verify_logout', context), headers=headers)
-
-    def _get_sids_from_cookie(self, cookie):
-        """Get cookie_dealer, client_id and sids from cookie."""
-        if cookie is None:
-            return None, None, None
-
-        cookie_dealer = CookieDealer(srv=self)
-        client_id = sids = None
-
-        _cval = cookie_dealer.get_cookie_value(cookie, self.sso_cookie_name)
-        if _cval:
-            (value, _ts, typ) = _cval
-            if typ == 'sso':
-                uid, client_id = value.split(DELIM)
-                try:
-                    sids = self.sdb.uid2sid[uid]
-                except (KeyError, IndexError):
-                    raise SubMismatch('Mismatch uid')
-        return cookie_dealer, client_id, sids
-
-    def end_session_endpoint(self, request="", cookie=None, **kwargs):
-        esr = EndSessionRequest().from_urlencoded(request)
-
-        logger.debug("End session request: {}", sanitize(esr.to_dict()))
-
-        # 2 ways of find out client ID and user. Either through a cookie
-        # or using the id_token_hint
-        try:
-            cookie_dealer, client_id, sids = self._get_sids_from_cookie(cookie)
-        except SubMismatch as error:
-            return error_response('invalid_request', '%s' % error)
-
-        if "id_token_hint" in esr:
-            id_token_hint = IdToken().from_jwt(esr["id_token_hint"],
-                                               keyjar=self.keyjar,
-                                               verify=True)
-            far_away = 86400*30  # 30 days
-
-            if client_id:
-                args = {'client_id': client_id}
-            else:
-                args = {}
-
-            try:
-                id_token_hint.verify(iss=self.baseurl, skew=far_away,
-                                     nonce_storage_time=far_away, **args)
-            except (VerificationError, NotForMe) as err:
-                logger.warning(
-                    'Verification error on id_token_hint: {}'.format(err))
-                return error_response('invalid_request', "Bad Id Token hint")
-
-            sub = id_token_hint["sub"]
-
-            if sids:
-                match = False
-                # verify that 'sub' are bound to 'user'
-                for sid in sids:
-                    if self.sdb[sid]['sub'] == sub:
-                        match = True
-                        break
-                if not match:
-                    return error_response('invalid_request', "Wrong user")
-            else:
-                try:
-                    sids = self.sdb.get_sids_by_sub(sub)
-                except IndexError:
-                    pass
-
-            if not client_id:
-                if len(id_token_hint['aud']) == 1:
-                    client_id = id_token_hint['aud'][0]
-                else:
-                    client_id = id_token_hint['azp']
-
-        if not client_id:
-            return error_response('invalid_request', "Could not find client ID")
-        if client_id not in self.cdb:
-            return error_response('invalid_request', "Unknown client")
-
-        match = False
-        for sid in sids:
-            if self.sdb[sid]['client_id'] == client_id:
-                match = True
-                break
-        if not match:
-            return error_response('invalid_request', "Unmatched client")
-
-        redirect_uri = None
-        if "post_logout_redirect_uri" in esr:
-            redirect_uri = self.verify_post_logout_redirect_uri(esr, client_id)
-            if not redirect_uri:
-                msg = "Post logout redirect URI verification failed!"
-                return error_response('invalid_request', msg)
-        else:  # If only one registered use that one
-            if len(self.cdb[client_id]["post_logout_redirect_uris"]) == 1:
-                _base, _query = self.cdb[client_id]["post_logout_redirect_uris"][0]
-                if _query:
-                    query_string = urlencode(
-                        [(key, v) for key in _query for v in _query[key]])
-                    redirect_uri = "%s?%s" % (_base, query_string)
-                else:
-                    redirect_uri = _base
-
-        for sid in sids:
-            del self.sdb[sid]
-
-        # Delete cookies
-        authn, _ = self.pick_auth(esr)
-        headers = [authn.delete_cookie(), self.delete_session_cookie()]
-        if cookie_dealer:
-            headers.append(cookie_dealer.delete_cookie(self.sso_cookie_name))
-
-        if redirect_uri is not None:
-            try:
-                _state = esr['state']
-            except KeyError:
-                redirect_uri = str(redirect_uri)
-            else:
-                if '?' in redirect_uri:
-                    redirect_uri += "&"
-                else:
-                    redirect_uri += "?"
-
-                redirect_uri += urlencode({'state': _state})
-
-            return SeeOther(redirect_uri, headers=headers)
-
-        return Response("Successful logout", headers=headers)
 
     def verify_endpoint(self, request="", cookie=None, **kwargs):
         """
@@ -715,7 +548,8 @@ class Provider(AProvider):
         self.sdb.do_sub(sid, cinfo['client_salt'], **kwargs)
         return sid
 
-    def match_sp_sep(self, first, second):
+    @staticmethod
+    def match_sp_sep(first, second):
         one = [set(v.split(" ")) for v in first]
         other = [set(v.split(" ")) for v in second]
         if not any(rt in one for rt in other):
@@ -843,7 +677,7 @@ class Provider(AProvider):
         aresp['client_id'] = areq['client_id']
 
         if self.events:
-            self.events.store('Protocol response', aresp)
+            self.events.store('protocol response', aresp)
 
         response = sanitize(aresp.to_dict())
         logger.info("authorization response: %s", response)
@@ -1849,7 +1683,7 @@ class Provider(AProvider):
             msg = "provider_info_response: {}"
             _log_info(msg.format(sanitize(_response.to_dict())))
             if self.events:
-                self.events.store('Protocol response', _response)
+                self.events.store('protocol response', _response)
 
             headers = [("Cache-Control", "no-store"), ("x-ffo", "bar")]
             if handle:
@@ -2080,3 +1914,355 @@ class Provider(AProvider):
                         kb.remove(key)
             if len(kb) == 0:
                 self.keyjar.issuer_keys[""].remove(kb)
+
+    # Below are LOGOUT related methods
+
+    def verify_post_logout_redirect_uri(self, esreq, client_id):
+        """
+
+        :param esreq: End session request
+        :param client_id: The Client ID
+        :return:
+        """
+        try:
+            redirect_uri = esreq["post_logout_redirect_uri"]
+        except KeyError:
+            logger.debug("Missing post_logout_redirect_uri parameter")
+            return
+
+        try:
+            accepted_urls = self.cdb[client_id]["post_logout_redirect_uris"]
+            if self._verify_url(redirect_uri, accepted_urls):
+                return redirect_uri
+        except Exception as exc:
+            msg = "An error occurred while verifying redirect URI: %s"
+            logger.debug(msg, str(exc))
+
+        return None
+
+    def let_user_verify_logout(self, uid, esr, cookie, redirect_uri):
+        if cookie:
+            headers = [cookie]
+        else:
+            headers = []
+
+        self.sdb.set_verified_logout(uid)
+
+        if redirect_uri is not None:
+            redirect = redirect_uri
+        else:
+            redirect = "/"
+        try:
+            tmp_id_token_hint = esr["id_token_hint"]
+        except KeyError:
+            tmp_id_token_hint = ""
+
+        context = {
+            "id_token_hint": tmp_id_token_hint,
+            "post_logout_redirect_uri": esr["post_logout_redirect_uri"],
+            "key": self.sdb.get_verify_logout(uid),
+            "redirect": redirect,
+            "action": "/" + EndSessionEndpoint("").etype
+        }
+        return Response(self.template_renderer('verify_logout', context), headers=headers)
+
+    def _get_uid_from_cookie(self, cookie):
+        """Get cookie_dealer, client_id and uid from cookie."""
+        if cookie is None:
+            return None, None, None
+
+        cookie_dealer = CookieDealer(srv=self)
+        client_id = uid = None
+
+        _cval = cookie_dealer.get_cookie_value(cookie, self.sso_cookie_name)
+        if _cval:
+            (value, _ts, typ) = _cval
+            if typ == 'sso':
+                uid, client_id = value.split(DELIM)
+
+        return cookie_dealer, client_id, uid
+
+    def do_back_channel_logout(self, cinfo, sub, sid):
+        """
+
+        :param cinfo: Client information
+        :param sub: Subject identifier
+        :param sid: The Issuer ID
+        :return: Tuple with logout URI and signed logout token
+        """
+
+        try:
+            back_channel_logout_uri = cinfo['backchannel_logout_uri']
+        except KeyError:
+            return None
+
+        # always include sub and sid so I don't check for
+        # backchannel_logout_session_required
+
+        payload = {
+            'sub': sub, 'sid': sid,
+            'events': {BACK_CHANNEL_LOGOUT_EVENT: {}}
+        }
+
+        try:
+            alg = cinfo['id_token_signed_response_alg']
+        except KeyError:
+            alg = self.capabilities['id_token_signing_alg_values_supported'][0]
+
+        _jws = JWT(self.keyjar, iss=self.name, lifetime=86400, sign_alg=alg)
+        _jws.with_jti = True
+        sjwt = _jws.pack(aud=cinfo["client_id"], **payload)
+
+        return back_channel_logout_uri, sjwt
+
+    def clean_sessions(self, usids):
+        _sdb = self.sdb
+        # Clean out all sessions
+        for sid in usids:
+            del _sdb[sid]
+
+    def logout_all_clients(self, sid, client_id):
+        _sdb = self.sdb
+
+        # Find all RPs this user has logged it from
+        uid = _sdb.get_uid_by_sid(sid)
+        _client_sid = {}
+        usids = _sdb.get_sids_from_uid(uid)
+        for usid in usids:
+            _client_sid[_sdb[usid]['client_id']] = usid
+
+        # Front-/Backchannel logout ?
+        _cdb = self.cdb
+        _iss = self.name
+        bc_logouts = {}
+        fc_iframes = {}
+        for _cid, _csid in _client_sid.items():
+            if 'backchannel_logout_uri' in _cdb[_cid]:
+                _sub = _sdb[_csid]['sub']
+                _spec = self.do_back_channel_logout(_cdb[_cid], _sub, _csid)
+                if _spec:
+                    bc_logouts[_cid] = _spec
+            elif 'frontchannel_logout_uri' in _cdb[_cid]:
+                # Construct an IFrame
+                _spec = do_front_channel_logout_iframe(_cdb[_cid], _iss, _csid)
+                if _spec:
+                    fc_iframes[_cid] = _spec
+
+        # Clean out all sessions
+        self.clean_sessions(usids)
+
+        return {'blu': bc_logouts, 'flu': fc_iframes}
+
+    def logout_from_client(self, sid, client_id):
+        """
+
+        :param sid: Session ID
+        :param client_id: Client ID
+        :return: Dictionary with back_channel and front_channel logout info.
+        """
+        _cdb = self.cdb
+        _sso_db = self.sdb
+
+        res = {}
+
+        if 'backchannel_logout_uri' in _cdb[client_id]:
+            _sub = _sso_db[sid]['sub']
+            _spec = self.do_back_channel_logout(_cdb[client_id], _sub, sid)
+            if _spec:
+                res['blu'] = {client_id: _spec}
+        elif 'frontchannel_logout_uri' in _cdb[client_id]:
+            # Construct an IFrame
+            _spec = do_front_channel_logout_iframe(_cdb[client_id], self.name,
+                                                   sid)
+            if _spec:
+                res['flu'] = {client_id: _spec}
+
+        # Clean out sessions
+        self.clean_sessions([sid])
+
+        return res
+
+    def end_session_endpoint(self, request="", cookie=None, **kwargs):
+        """
+        This is where a RP initiated Logout starts
+
+        :param request: The logout request
+        :param cookie:
+        :param kwargs:
+        :return: Returns a dictionary with one key 'sjwt' and the value
+            being a signed JWT token with session information.
+        """
+        esr = EndSessionRequest().from_urlencoded(request)
+
+        logger.debug("End session request: {}", sanitize(esr.to_dict()))
+
+        if self.events:
+            self.events.store('protocol request', esr)
+
+        # 2 ways of find out client ID and user. Either through a cookie
+        # or using the id_token_hint
+        try:
+            cookie_dealer, client_id, uid = self._get_uid_from_cookie(cookie)
+        except SubMismatch as error:
+            return error_response('invalid_request', '%s' % error)
+
+        sid = ''
+
+        if "id_token_hint" in esr:
+            id_token_hint = IdToken().from_jwt(esr["id_token_hint"],
+                                               keyjar=self.keyjar,
+                                               verify=True)
+            far_away = 86400 * 30  # 30 days
+
+            if client_id:
+                args = {'client_id': client_id}
+            else:
+                args = {}
+
+            try:
+                id_token_hint.verify(iss=self.baseurl, skew=far_away,
+                                     nonce_storage_time=far_away, **args)
+            except (VerificationError, NotForMe) as err:
+                logger.warning(
+                    'Verification error on id_token_hint: {}'.format(err))
+                return error_response('invalid_request', "Bad Id Token hint")
+
+            sub = id_token_hint["sub"]
+
+            if uid:
+                match = False
+                # verify that 'sub' are bound to 'uid'
+                if self.sdb.get_uid_by_sub(sub) != uid:
+                    return error_response('invalid_request', "Wrong user")
+            else:
+                try:
+                    uid = self.sdb.get_uid_by_sub(sub)
+                except IndexError:
+                    pass
+
+            if not client_id:
+                if len(id_token_hint['aud']) == 1:
+                    client_id = id_token_hint['aud'][0]
+                else:
+                    client_id = id_token_hint['azp']
+
+            sids = self.sdb.get_sids_by_sub(sub)
+            for sid in sids:
+                if self.sdb[sid]['client_id'] == client_id:
+                    break
+
+        if not client_id:
+            return error_response('invalid_request', "Could not find client ID")
+        if client_id not in self.cdb:
+            return error_response('invalid_request', "Unknown client")
+
+        redirect_uri = None
+        if "post_logout_redirect_uri" in esr:
+            redirect_uri = self.verify_post_logout_redirect_uri(esr, client_id)
+            if not redirect_uri:
+                msg = "Post logout redirect URI verification failed!"
+                return error_response('invalid_request', msg)
+        else:  # If only one registered use that one
+            try:
+                _ruri = self.cdb[client_id]["post_logout_redirect_uris"]
+            except KeyError:
+                msg = "Missing post_logout_redirect_uri"
+                return error_response('invalid_request', msg)
+
+            if len(_ruri) == 1:
+                _base, _query = _ruri[0]
+                if _query:
+                    query_string = urlencode(
+                        [(key, v) for key in _query for v in _query[key]])
+                    redirect_uri = "%s?%s" % (_base, query_string)
+                else:
+                    redirect_uri = _base
+
+        # redirect user to OP logout verification page
+        payload = {
+            'uid': uid, 'client_id': client_id,
+            'redirect_uri': redirect_uri, 'sid': sid
+        }
+        if 'state' in esr:
+            payload['state'] = esr['state']
+
+        if self.events:
+            self.events.store('object args', '{}'.format(payload))
+
+        # From me to me
+        _jws = JWT(self.keyjar, iss=self.name, lifetime=86400,
+                   sign_alg=self.signing_alg)
+        sjwt = _jws.pack(aud=[self.name], **payload)
+
+        location = '{}?{}'.format(self.logout_verify_url,
+                                  urlencode({'sjwt': sjwt}))
+        return SeeOther(location)
+
+    def unpack_signed_jwt(self, sjwt):
+        verifier = JWT(self.keyjar)
+        try:
+            return verifier.unpack(sjwt)
+        except Exception as err:
+            raise ValueError(err)
+
+    def do_verified_logout(self, sid, client_id, alla=False, **kwargs):
+        if alla:
+            logout_spec = self.logout_all_clients(sid=sid, client_id=client_id)
+        else:
+            logout_spec = self.logout_from_client(sid=sid, client_id=client_id)
+
+        if self.events:
+            self.events.store('object args', '{}'.format(logout_spec))
+
+        # take care of Back channel logout first
+        for _cid, spec in logout_spec['blu'].items():
+            _url, sjwt = spec
+            logger.info('logging out from {} at {}'.format(_cid, _url))
+
+            res = self.httpc.http_request(
+                _url, 'POST', data="logout_token={}".format(sjwt))
+
+            if res.status_code < 300:
+                logger.info('Logged out from {}'.format(_cid))
+            elif res.status_code >= 400:
+                logger.info('failed to logout from {}'.format(_cid))
+
+        for _cid in logout_spec['flu'].keys():
+            logger.info('Adding logout iframe for {}'.format(_cid))
+
+        # kill cookies
+        kaka1 = self.write_session_cookie('removed', 60)
+        kaka2 = self.cookie_func('', typ="sso",
+                                 cookie_name=self.sso_cookie_name,
+                                 kill=True)
+
+        return {'iframe': logout_spec['flu'].values(),
+                'cookie': [kaka1, kaka2]}
+
+
+def do_front_channel_logout_iframe(c_info, iss, sid):
+    """
+
+    :param c_info: Client info
+    :param iss: Issuer ID
+    :param sid: Session ID
+    :return: IFrame
+    """
+    try:
+        frontchannel_logout_uri = c_info['frontchannel_logout_uri']
+    except KeyError:
+        return None
+
+    try:
+        flsr = c_info['frontchannel_logout_session_required']
+    except KeyError:
+        flsr = False
+
+    if flsr:
+        _query = urlencode({'iss': iss, 'sid': sid})
+        _iframe = '<iframe src="{}?{}">'.format(frontchannel_logout_uri,
+                                                _query)
+    else:
+        _iframe = '<iframe src="{}">'.format(frontchannel_logout_uri)
+
+    return _iframe
