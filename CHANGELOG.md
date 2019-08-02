@@ -13,10 +13,12 @@ The format is based on the [KeepAChangeLog] project.
 ### Removed
 - [#671] Removed deprecated request/response_cls kwargs from Provider/Client methods
 - [#677] Removed more deprecated code
+- [#676] Removed deprecated message factory and related stuff
 
 [#671]: https://github.com/OpenIDC/pyoidc/pull/671
 [#677]: https://github.com/OpenIDC/pyoidc/pull/677
 [#602]: https://github.com/OpenIDC/pyoidc/issues/602
+[#676]: https://github.com/OpenIDC/pyoidc/pull/676
 
 ## 1.0.1 [2019-06-30]
 
