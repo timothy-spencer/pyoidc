@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 import pytest
 import responses
 from freezegun import freeze_time
-from jwkest import BadSignature
+from jwcrypto.jws import InvalidJWSSignature
 from jwkest.jwk import SYMKey
 
 from oic.oauth2.message import MissingSigningKey
@@ -804,7 +804,7 @@ class TestOICConsumer:
     def test_faulty_id_token(self):
         _faulty_signed_jwt = self._faulty_id_token()
 
-        with pytest.raises(BadSignature):
+        with pytest.raises(InvalidJWSSignature):
             IdToken().from_jwt(_faulty_signed_jwt, key=[SYMKey(key="TestPassword")])
 
         # What if no verification key is given ?
@@ -844,5 +844,5 @@ class TestOICConsumer:
 
         assert result.status_code == 302
         query = urlparse(result.headers["location"]).query
-        with pytest.raises(BadSignature):
+        with pytest.raises(InvalidJWSSignature):
             self.consumer.parse_authz(query=query)

@@ -15,10 +15,12 @@ from typing import Union  # noqa - This is used for MyPy
 from urllib.parse import parse_qs
 from urllib.parse import urlencode
 
-from jwcrypto.jwk import JWK
-from jwcrypto.jwt import JWT as crypt_JWT
-from jwcrypto.jws import JWS as crypt_JWS
+from jwcrypto.common import base64url_decode
 from jwcrypto.jwe import JWE as crypt_JWE
+from jwcrypto.jwk import JWK
+from jwcrypto.jws import JWS as crypt_JWS
+from jwcrypto.jws import InvalidJWSSignature
+from jwcrypto.jwt import JWT as crypt_JWT
 from jwkest import as_unicode
 from jwkest import b64d
 from jwkest import jwe
@@ -136,16 +138,16 @@ def gather_keys(comb, collection, jso, target):
 def convert_key_to_jwcrypto(jwkest_key):
     """Temporary helper to convert key from jwkest to jwcrypto."""
     temp = jwkest_key.serialize(private=True)
-    if isinstance(jwkest_key, RSAKey) and jwkest_key.d != '':
+    if isinstance(jwkest_key, RSAKey) and jwkest_key.d != "":
         # Recalculate since they are not included in jwkest
-        temp['dp'] = long_to_base64(jwkest_key.d % (jwkest_key.p - 1))
-        temp['dq'] = long_to_base64(jwkest_key.d % (jwkest_key.q - 1))
+        temp["dp"] = long_to_base64(jwkest_key.d % (jwkest_key.p - 1))
+        temp["dq"] = long_to_base64(jwkest_key.d % (jwkest_key.q - 1))
         # This only works for primes, which we have...
-        temp['qi'] = long_to_base64(pow(jwkest_key.q, jwkest_key.p - 2, jwkest_key.p))
+        temp["qi"] = long_to_base64(pow(jwkest_key.q, jwkest_key.p - 2, jwkest_key.p))
     return JWK(**temp)
 
 
-def pick_keys(keys: List[Key], alg: str) -> Key:
+def pick_keys(keys: List[Key], alg: str, usage: str = "sig") -> Key:
     """Pick correct key based on alg.
 
     Returns first key for now. Might get redone after complete switch to jwcrypto.
@@ -159,9 +161,10 @@ def pick_keys(keys: List[Key], alg: str) -> Key:
     else:
         return None
     for key in keys:
-        if key.kty == key_type:
+        if key.kty == key_type and (key.use == "" or key.use == usage):
             return key
     return None
+
 
 def swap_dict(dic):
     return dict([(val, key) for key, val in dic.items()])
@@ -515,10 +518,10 @@ class Message(MutableMapping):
         # FIXME: This can be removed once the keys are in jwcrypto format as well
         picked_key = pick_keys(key, algorithm)
         if picked_key is None:
-            headers = {'alg': 'none'}
+            headers = {"alg": "none"}
         else:
             k = convert_key_to_jwcrypto(picked_key)
-            headers = {'alg': picked_key.alg or algorithm}
+            headers = {"alg": picked_key.alg or algorithm}
 
         _jws = crypt_JWT(claims=self.to_json(lev), header=headers)
         if picked_key is not None:
@@ -528,7 +531,7 @@ class Message(MutableMapping):
             # Pack manually - jwcrypto has no support for this
             header = b64encode(_jws.header.encode()).decode().rstrip("=")
             payload = b64encode(_jws.claims.encode()).decode().rstrip("=")
-            return header + "." + payload
+            return header + "." + payload + "."
 
     def _add_key(self, keyjar, issuer, key, key_type="", kid="", no_kid_issuer=None):
 
@@ -656,17 +659,54 @@ class Message(MutableMapping):
             # First decrypt the token ...
             pass
         if isinstance(_crypt_jw.token, crypt_JWS):
+            if "algs" in kwargs and "sign" in kwargs["algs"]:
+                _alg = _crypt_jw.token.jose_header.get("alg")
+                if _alg is not None and kwargs["algs"]["sign"] != _alg:
+                    raise WrongSigningAlgorithm(
+                        "%s != %s" % (_alg, kwargs["algs"]["sign"])
+                    )
+            if _crypt_jw.token.jose_header.get("alg") == "none":
+                # Unpack manually, there is no support in jwcrypto
+                parts = txt.split(".")
+                if len(parts[2]) > 0:
+                    raise InvalidJWSSignature("Signature in plaintext JWT")
+                self.jws_header = json.loads(base64url_decode(parts[0]))
+                return self.from_json(base64url_decode(parts[1]))
             # Verify the signature of the token
             _crypt_kid = _crypt_jw.token.jose_header.get("kid")
-            if _crypt_kid is not None:
-                __import__('pdb').set_trace()
+            if key is not None:
+                keys = key
+            elif _crypt_kid is not None:
                 # FIXME: jwcrypt does not allow to access unverified payload directly
-                key = keyjar.get_key_by_kid(_crypt_kid, json.loads(_crypt_jw.token.objects['payload']).get('iss'))
+                keys = [
+                    keyjar.get_key_by_kid(
+                        _crypt_kid,
+                        json.loads(_crypt_jw.token.objects["payload"]).get("iss"),
+                    )
+                ]
+            else:
+                if keyjar is not None:
+                    keys = keyjar.get_verify_key(owner="")
+                else:
+                    raise MissingSigningKey("No signing key")
+            for key in keys:
                 key = convert_key_to_jwcrypto(key)
+                try:
+                    _crypt_jw = crypt_JWT(key=key, jwt=txt)
+                except InvalidJWSSignature:
+                    # Just try different key
+                    pass
+                else:
+                    # Decrypted skip the rest of the keys if there are any
+                    break
+            else:
+                raise InvalidJWSSignature()
             # FIXME: Cannot we get it from the existing object?
-            _crypt_jw = crypt_JWT(key=key, jwt=txt)
             self.jwt = txt
-            self.jws_header = _crypt_jw.header
+            try:
+                self.jws_header = json.loads(_crypt_jw.header)
+            except KeyError:
+                raise InvalidJWSSignature()
             return self.from_json(_crypt_jw.claims)
 
         _jw = jwe.factory(txt)

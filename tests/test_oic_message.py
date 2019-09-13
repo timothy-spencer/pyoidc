@@ -5,7 +5,7 @@ from urllib.parse import parse_qs
 from urllib.parse import urlencode
 
 import pytest
-from jwkest import BadSignature
+from jwcrypto.jws import InvalidJWSSignature
 from jwkest.jwk import SYMKey
 from jwkest.jws import left_hash
 
@@ -569,7 +569,7 @@ class TestAccessTokenResponse(object):
         }
 
         at = AccessTokenResponse(**_info)
-        with pytest.raises(BadSignature):
+        with pytest.raises(InvalidJWSSignature):
             at.verify(key=[key])
 
     def test_wrong_alg(self):
