@@ -23,24 +23,17 @@ from jwcrypto.jws import InvalidJWSSignature
 from jwcrypto.jwt import JWT as crypt_JWT
 from jwkest import as_unicode
 from jwkest import b64d
-from jwkest import jwe
-from jwkest import jws
 from jwkest import long_to_base64
 from jwkest.jwe import JWE
 from jwkest.jwk import Key
 from jwkest.jwk import RSAKey
 from jwkest.jwk import keyitems2keyreps
-from jwkest.jws import JWS
-from jwkest.jws import NoSuitableSigningKeys
 from jwkest.jws import alg2keytype
-from jwkest.jwt import JWT
 
 from oic.exception import MessageException
 from oic.exception import PyoidcError
 from oic.oauth2.exception import VerificationError
 from oic.utils.keyio import key_summary
-from oic.utils.keyio import update_keyjar
-from oic.utils.sanitize import sanitize
 
 logger = logging.getLogger(__name__)
 
@@ -657,7 +650,39 @@ class Message(MutableMapping):
         _crypt_jw = crypt_JWT(jwt=txt)
         if isinstance(_crypt_jw.token, crypt_JWE):
             # First decrypt the token ...
-            pass
+            if "algs" in kwargs and "encalg" in kwargs["algs"]:
+                if kwargs["algs"]["encalg"] != _crypt_jw.token.jose_header.get("alg"):
+                    raise WrongEncryptionAlgorithm(
+                        "%s != %s"
+                        % (
+                            _crypt_jw.token.jose_header.get("alg"),
+                            kwargs["algs"]["encalg"],
+                        )
+                    )
+                if kwargs["algs"]["encenc"] != _crypt_jw.token.jose_header.get("enc"):
+                    raise WrongEncryptionAlgorithm(
+                        "%s != %s"
+                        % (
+                            _crypt_jw.token.jose_header.get("enc"),
+                            kwargs["algs"]["encenc"],
+                        )
+                    )
+            if keyjar:
+                dkeys = keyjar.get_decrypt_key(owner="")
+                if "sender" in kwargs:
+                    dkeys.extend(keyjar.get_verify_key(owner=kwargs["sender"]))
+            elif key:
+                dkeys = key
+            else:
+                dkeys = []
+            for _key in dkeys:
+                _key = convert_key_to_jwcrypto(_key)
+                # Try to decrypt
+                _crypt_jw = crypt_JWT(jwt=txt, key=_key)
+            # Assign the decrypted object
+            self.jwe_header = json.loads(_crypt_jw.header)
+            txt = _crypt_jw.claims
+            _crypt_jw = crypt_JWT(jwt=txt)
         if isinstance(_crypt_jw.token, crypt_JWS):
             if "algs" in kwargs and "sign" in kwargs["algs"]:
                 _alg = _crypt_jw.token.jose_header.get("alg")
@@ -708,94 +733,6 @@ class Message(MutableMapping):
             except KeyError:
                 raise InvalidJWSSignature()
             return self.from_json(_crypt_jw.claims)
-
-        _jw = jwe.factory(txt)
-        if _jw:
-            logger.debug("JWE headers: {}".format(_jw.jwt.headers))
-
-            if "algs" in kwargs and "encalg" in kwargs["algs"]:
-                if kwargs["algs"]["encalg"] != _jw["alg"]:
-                    raise WrongEncryptionAlgorithm(
-                        "%s != %s" % (_jw["alg"], kwargs["algs"]["encalg"])
-                    )
-                if kwargs["algs"]["encenc"] != _jw["enc"]:
-                    raise WrongEncryptionAlgorithm(
-                        "%s != %s" % (_jw["enc"], kwargs["algs"]["encenc"])
-                    )
-            if keyjar:
-                dkeys = keyjar.get_decrypt_key(owner="")
-                if "sender" in kwargs:
-                    dkeys.extend(keyjar.get_verify_key(owner=kwargs["sender"]))
-            elif key:
-                dkeys = key
-            else:
-                dkeys = []
-
-            logger.debug("Decrypt class: {}".format(_jw.__class__))
-            _res = _jw.decrypt(txt, dkeys)
-            logger.debug("decrypted message:{}".format(_res))
-            if isinstance(_res, tuple):
-                txt = as_unicode(_res[0])
-            elif isinstance(_res, list) and len(_res) == 2:
-                txt = as_unicode(_res[0])
-            else:
-                txt = as_unicode(_res)
-            self.jwe_header = _jw.jwt.headers
-
-        _jw = jws.factory(txt)
-        if _jw:
-            if "algs" in kwargs and "sign" in kwargs["algs"]:
-                _alg = _jw.jwt.headers["alg"]
-                if kwargs["algs"]["sign"] != _alg:
-                    raise WrongSigningAlgorithm(
-                        "%s != %s" % (_alg, kwargs["algs"]["sign"])
-                    )
-            try:
-                _jwt = JWT().unpack(txt)
-                jso = _jwt.payload()
-                _header = _jwt.headers
-
-                if key is None and keyjar is not None:
-                    key = keyjar.get_verify_key(owner="")
-                elif key is None:
-                    key = []
-
-                if keyjar is not None and "sender" in kwargs:
-                    key.extend(keyjar.get_verify_key(owner=kwargs["sender"]))
-
-                logger.debug("Raw JSON: {}".format(sanitize(jso)))
-                logger.debug("JWS header: {}".format(sanitize(_header)))
-                if _header["alg"] == "none":
-                    pass
-                elif verify:
-                    if keyjar:
-                        key = self.get_verify_keys(
-                            keyjar, key, jso, _header, _jw, **kwargs
-                        )
-
-                    if "alg" in _header and _header["alg"] != "none":
-                        if not key:
-                            raise MissingSigningKey("alg=%s" % _header["alg"])
-
-                    logger.debug("Found signing key.")
-                    try:
-                        _jw.verify_compact(txt, key)
-                    except NoSuitableSigningKeys:
-                        if keyjar:
-                            update_keyjar(keyjar)
-                            key = self.get_verify_keys(
-                                keyjar, key, jso, _header, _jw, **kwargs
-                            )
-                            _jw.verify_compact(txt, key)
-            except Exception:
-                raise
-            else:
-                self.jws_header = _jwt.headers
-        else:
-            jso = json.loads(txt)
-
-        self.jwt = txt
-        return self.from_dict(jso)
 
     def __str__(self):
         return "{}".format(self.to_dict())
