@@ -15,8 +15,9 @@ from typing import Union  # noqa - This is used for MyPy
 from urllib.parse import parse_qs
 from urllib.parse import urlencode
 
-from jwcrypto.common import base64url_decode
+from jwcrypto.common import base64url_decode, json_encode
 from jwcrypto.jwe import JWE as crypt_JWE
+from jwcrypto.jwe import InvalidJWEData
 from jwcrypto.jwk import JWK
 from jwcrypto.jws import JWS as crypt_JWS
 from jwcrypto.jws import InvalidJWSSignature
@@ -128,15 +129,15 @@ def gather_keys(comb, collection, jso, target):
     return comb
 
 
-def convert_key_to_jwcrypto(jwkest_key):
+def convert_key_to_jwcrypto(jwkey):
     """Temporary helper to convert key from jwkest to jwcrypto."""
-    temp = jwkest_key.serialize(private=True)
-    if isinstance(jwkest_key, RSAKey) and jwkest_key.d != "":
+    temp = jwkey.serialize(private=True)
+    if isinstance(jwkey, RSAKey) and jwkey.d != "":
         # Recalculate since they are not included in jwkest
-        temp["dp"] = long_to_base64(jwkest_key.d % (jwkest_key.p - 1))
-        temp["dq"] = long_to_base64(jwkest_key.d % (jwkest_key.q - 1))
+        temp["dp"] = long_to_base64(jwkey.d % (jwkey.p - 1))
+        temp["dq"] = long_to_base64(jwkey.d % (jwkey.q - 1))
         # This only works for primes, which we have...
-        temp["qi"] = long_to_base64(pow(jwkest_key.q, jwkest_key.p - 2, jwkest_key.p))
+        temp["qi"] = long_to_base64(pow(jwkey.q, jwkey.p - 2, jwkey.p))
     return JWK(**temp)
 
 
@@ -676,9 +677,18 @@ class Message(MutableMapping):
             else:
                 dkeys = []
             for _key in dkeys:
-                _key = convert_key_to_jwcrypto(_key)
                 # Try to decrypt
-                _crypt_jw = crypt_JWT(jwt=txt, key=_key)
+                _key = convert_key_to_jwcrypto(_key)
+                try:
+                    _crypt_jw = crypt_JWT(jwt=txt, key=_key)
+                except InvalidJWEData:
+                    # Wrong key ...
+                    pass
+                else:
+                    break
+            else:
+                # FIXME: Raise decrytpion error
+                raise MissingSigningKey("")
             # Assign the decrypted object
             self.jwe_header = json.loads(_crypt_jw.header)
             txt = _crypt_jw.claims
@@ -896,8 +906,11 @@ class Message(MutableMapping):
         :param lev: Used for JSON construction
         :return: An encrypted JWT. If encryption failed an exception will be raised.
         """
+        __import__('pdb').set_trace()
         if isinstance(keys, dict):
             keys = keyitems2keyreps(keys)
+
+        cr_jwe = crypt_JWE(self.to_json(), json_encode({"alg": alg, "enc": enc}))
 
         _jwe = JWE(self.to_json(lev), alg=alg, enc=enc)
         return _jwe.encrypt(keys)
@@ -910,12 +923,23 @@ class Message(MutableMapping):
         :param keys: Dictionary, keys are key type and key is the value or simple list.
         :return: The decrypted message. If decryption failed an exception will be raised.
         """
+        __import__('pdb').set_trace()
         if isinstance(keys, dict):
             keys = keyitems2keyreps(keys)
 
-        jwe = JWE()
-        _res = jwe.decrypt(msg, keys)
-        return self.from_json(_res.decode())
+        jwe = crypt_JWE()
+        jwe.deserialize(msg)
+        for key in keys:
+            try:
+                jwe.decrypt(key=convert_key_to_jwcrypto(key))
+            except InvalidJWEData:
+                pass
+            else:
+                break
+        else:
+            # FIXME: Raise decrytpion error
+            raise MissingSigningKey("")
+        return self.from_json(jwe.payload)
 
     def copy(self):
         return copy.deepcopy(self)
