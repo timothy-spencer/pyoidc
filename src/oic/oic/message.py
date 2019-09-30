@@ -282,30 +282,26 @@ def verify_id_token(instance, check_hash=False, **kwargs):
         except KeyError:
             pass
 
-    _jws = str(instance["id_token"])
+#    _jws = str(instance["id_token"])
+#
+#    # It can be encrypted, so try to decrypt first
+#    _jwe = JWE_factory(_jws)
+#    if _jwe is not None:
+#        try:
+#            _jws = _jwe.decrypt(keys=kwargs["keyjar"].get_decrypt_key())
+#        except JWEException as err:
+#            raise VerificationError("Could not decrypt id_token", err)
+#    _packer = JWT()
+#    _body = _packer.unpack(_jws).payload()
+#
+#    if "keyjar" in kwargs:
+#        try:
+#            if _body["iss"] not in kwargs["keyjar"]:
+#                raise ValueError("Unknown issuer")
+#        except KeyError:
+#            raise MissingRequiredAttribute("iss")
 
-    # It can be encrypted, so try to decrypt first
-    _jwe = JWE_factory(_jws)
-    if _jwe is not None:
-        try:
-            _jws = _jwe.decrypt(keys=kwargs["keyjar"].get_decrypt_key())
-        except JWEException as err:
-            raise VerificationError("Could not decrypt id_token", err)
-    _packer = JWT()
-    _body = _packer.unpack(_jws).payload()
-
-    if "keyjar" in kwargs:
-        try:
-            if _body["iss"] not in kwargs["keyjar"]:
-                raise ValueError("Unknown issuer")
-        except KeyError:
-            raise MissingRequiredAttribute("iss")
-
-    if _jwe is not None:
-        # Use the original encrypted token to set correct headers
-        idt = IdToken().from_jwt(str(instance["id_token"]), **args)
-    else:
-        idt = IdToken().from_jwt(_jws, **args)
+    idt = IdToken().from_jwt(str(instance["id_token"]), **args)
     if not idt.verify(**kwargs):
         raise VerificationError("Could not verify id_token", idt)
 

@@ -701,12 +701,9 @@ class Message(MutableMapping):
                         "%s != %s" % (_alg, kwargs["algs"]["sign"])
                     )
             if _crypt_jw.token.jose_header.get("alg") == "none":
-                # Unpack manually, there is no support in jwcrypto
-                parts = txt.split(".")
-                if len(parts[2]) > 0:
-                    raise InvalidJWSSignature("Signature in plaintext JWT")
-                self.jws_header = json.loads(base64url_decode(parts[0]))
-                return self.from_json(base64url_decode(parts[1]))
+                _crypt_jw = crypt_JWT(algs=['none'], jwt=txt, key=JWK(generate='oct', size=0))
+                self.jws_header = json.loads(_crypt_jw.header)
+                return self.from_json(_crypt_jw.claims)
             # Verify the signature of the token
             _crypt_kid = _crypt_jw.token.jose_header.get("kid")
             if key is not None:
@@ -906,14 +903,13 @@ class Message(MutableMapping):
         :param lev: Used for JSON construction
         :return: An encrypted JWT. If encryption failed an exception will be raised.
         """
-        __import__('pdb').set_trace()
         if isinstance(keys, dict):
             keys = keyitems2keyreps(keys)
 
         cr_jwe = crypt_JWE(self.to_json(), json_encode({"alg": alg, "enc": enc}))
-
-        _jwe = JWE(self.to_json(lev), alg=alg, enc=enc)
-        return _jwe.encrypt(keys)
+        for key in keys:
+            cr_jwe.add_recipient(convert_key_to_jwcrypto(key))
+        return cr_jwe.serialize(compact=True)
 
     def from_jwe(self, msg, keys):
         """
@@ -923,7 +919,6 @@ class Message(MutableMapping):
         :param keys: Dictionary, keys are key type and key is the value or simple list.
         :return: The decrypted message. If decryption failed an exception will be raised.
         """
-        __import__('pdb').set_trace()
         if isinstance(keys, dict):
             keys = keyitems2keyreps(keys)
 
