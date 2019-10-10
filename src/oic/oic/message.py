@@ -558,7 +558,7 @@ class OpenIDSchema(Message):
     def verify(self, **kwargs):
         super().verify(**kwargs)
 
-        if "birthdate" in self and self["birthdate"] is not None:
+        if "birthdate" in self:
             # Either YYYY-MM-DD or just YYYY or 0000-MM-DD
             try:
                 time.strptime(self["birthdate"], "%Y-%m-%d")
@@ -932,7 +932,8 @@ class AuthnToken(Message):
     c_param = {
         "iss": SINGLE_REQUIRED_STRING,
         "sub": SINGLE_REQUIRED_STRING,
-        "aud": REQUIRED_LIST_OF_STRINGS,  # Array of strings or string
+        # XXX making aud a string makes it so that we don't bump into https://github.com/18F/identity-idp/issues/3334
+        "aud": SINGLE_REQUIRED_STRING,  # Array of strings or string
         "jti": SINGLE_REQUIRED_STRING,
         "exp": SINGLE_REQUIRED_INT,
         "iat": SINGLE_OPTIONAL_INT,
